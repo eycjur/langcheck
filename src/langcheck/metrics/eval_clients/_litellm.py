@@ -18,6 +18,14 @@ from ._base import EvalClient, TextResponseWithLogProbs
 from .extractor import Extractor
 
 
+class TextResponseWithReasoning(BaseModel):
+    """Response object that includes reasoning trace for reasoning models."""
+    
+    response_text: str
+    reasoning_trace: str | None = None
+    model_name: str | None = None
+
+
 class LiteLLMEvalClient(EvalClient):
     """EvalClient defined for litellm."""
 
@@ -84,6 +92,16 @@ class LiteLLMEvalClient(EvalClient):
         else:
             self._extractor = extractor
 
+    def _is_reasoning_model(self) -> bool:
+        """Check if the model is a reasoning model that provides reasoning traces."""
+        reasoning_models = [
+            "o1", "o1-mini", "o1-preview", "o1-pro",
+            "o3", "o3-mini", "o3-preview", "o3-pro",
+            "gpt-4o-reasoning", "gpt-4o-mini-reasoning"
+        ]
+        model_name = self._model.lower()
+        return any(reasoning_model in model_name for reasoning_model in reasoning_models)
+
     def _call_api(
         self,
         prompts: list[str],
@@ -106,6 +124,7 @@ class LiteLLMEvalClient(EvalClient):
         ]
 
         logprobs = top_logprobs is not None
+        is_reasoning_model = self._is_reasoning_model()
 
         if self._use_async:
             # A helper function to call the async API.
@@ -122,6 +141,9 @@ class LiteLLMEvalClient(EvalClient):
                             api_base=self._api_base,
                             api_version=self._api_version,
                             drop_params=True,
+                            # For reasoning models, request reasoning trace
+                            **({"response_format": {"type": "text", "include_reasoning": True}} 
+                               if is_reasoning_model else {}),
                             **self._kwargs,
                         )
                         for model_input in model_inputs
@@ -150,6 +172,9 @@ class LiteLLMEvalClient(EvalClient):
                         api_base=self._api_base,
                         api_version=self._api_version,
                         drop_params=True,
+                        # For reasoning models, request reasoning trace
+                        **({"response_format": {"type": "text", "include_reasoning": True}} 
+                           if is_reasoning_model else {}),
                         **self._kwargs,
                     )
                 except Exception as e:
@@ -198,12 +223,93 @@ class LiteLLMEvalClient(EvalClient):
             prompts=prompts,
             tqdm_description=tqdm_description,
         )
-        response_texts = [
-            response.choices[0].message.content if response else None
-            for response in responses
-        ]
+        response_texts = []
+        for response in responses:
+            if response is None:
+                response_texts.append(None)
+                continue
+                
+            content = response.choices[0].message.content
+            
+            # For reasoning models, append reasoning trace if available
+            if self._is_reasoning_model() and content:
+                reasoning_trace = None
+                
+                # Try to extract reasoning from the response
+                if hasattr(response.choices[0].message, 'reasoning'):
+                    reasoning_trace = response.choices[0].message.reasoning
+                elif hasattr(response.choices[0], 'reasoning'):
+                    reasoning_trace = response.choices[0].reasoning
+                
+                # If reasoning trace is available, append it to the content
+                if reasoning_trace:
+                    content = f"{content}\n\n**Reasoning Trace:**\n{reasoning_trace}"
+                    
+            response_texts.append(content)
 
         return response_texts
+
+    def get_text_responses_with_reasoning(
+        self,
+        prompts: list[str],
+        *,
+        tqdm_description: str | None = None,
+    ) -> list[TextResponseWithReasoning | None]:
+        """Get responses with reasoning traces for reasoning models.
+        
+        Args:
+            prompts: The prompts you want to get the responses for.
+            tqdm_description: Description for the progress bar.
+            
+        Returns:
+            A list of TextResponseWithReasoning objects containing both the final 
+            response and reasoning trace. Returns None if the evaluation fails.
+        """
+        if not isinstance(prompts, list):
+            raise ValueError(
+                f"prompts must be a list, not a {type(prompts).__name__}"
+            )
+
+        tqdm_description = tqdm_description or "Getting responses with reasoning"
+        responses = self._call_api(
+            prompts=prompts,
+            tqdm_description=tqdm_description,
+        )
+        
+        response_objects = []
+        for response in responses:
+            if response is None:
+                response_objects.append(None)
+                continue
+                
+            # Extract reasoning trace and final response
+            reasoning_trace = None
+            response_text = response.choices[0].message.content
+            
+            # For reasoning models, check if reasoning trace is available
+            if self._is_reasoning_model():
+                # Try to extract reasoning from the response
+                if hasattr(response.choices[0].message, 'reasoning'):
+                    reasoning_trace = response.choices[0].message.reasoning
+                elif hasattr(response.choices[0], 'reasoning'):
+                    reasoning_trace = response.choices[0].reasoning
+                # If reasoning is embedded in the content, try to extract it
+                elif response_text and "**Reasoning:**" in response_text:
+                    parts = response_text.split("**Reasoning:**", 1)
+                    if len(parts) == 2:
+                        reasoning_trace = parts[1].split("**Answer:**")[0].strip()
+                        if "**Answer:**" in response_text:
+                            response_text = response_text.split("**Answer:**")[1].strip()
+            
+            response_objects.append(
+                TextResponseWithReasoning(
+                    response_text=response_text,
+                    reasoning_trace=reasoning_trace,
+                    model_name=self._model
+                )
+            )
+        
+        return response_objects
 
     def get_text_responses_with_log_likelihood(
         self,
